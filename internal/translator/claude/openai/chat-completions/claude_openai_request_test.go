@@ -281,3 +281,53 @@ func TestConvertOpenAIRequestToClaude_SystemOnlyInputKeepsFallbackUserMessage(t 
 		t.Fatalf("Expected fallback text %q, got %q", "", got)
 	}
 }
+
+func TestConvertOpenAIRequestToClaude_PreservesTextCacheControl(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "stable prefix", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+					{"type": "text", "text": "latest input"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+
+	if got := resultJSON.Get("messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("cache_control.type = %q, want %q. Result: %s", got, "ephemeral", string(result))
+	}
+	if got := resultJSON.Get("messages.0.content.0.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("cache_control.ttl = %q, want %q. Result: %s", got, "1h", string(result))
+	}
+	if resultJSON.Get("messages.0.content.1.cache_control").Exists() {
+		t.Fatalf("unexpected cache_control on non-marked text part. Result: %s", string(result))
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_PreservesSystemTextCacheControl(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"messages": [
+			{
+				"role": "system",
+				"content": [
+					{"type": "text", "text": "system prefix", "cache_control": {"type": "ephemeral"}}
+				]
+			},
+			{"role": "user", "content": "Hello"}
+		]
+	}`
+
+	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+
+	if got := resultJSON.Get("system.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system cache_control.type = %q, want %q. Result: %s", got, "ephemeral", string(result))
+	}
+}
