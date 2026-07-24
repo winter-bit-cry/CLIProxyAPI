@@ -358,6 +358,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, opts.Headers); errHeaders != nil {
 		return resp, errHeaders
 	}
+	stripClaudeRedactThinkingBeta(httpReq.Header, bodyForUpstream)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -549,6 +550,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, opts.Headers); errHeaders != nil {
 		return nil, errHeaders
 	}
+	stripClaudeRedactThinkingBeta(httpReq.Header, bodyForUpstream)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -991,6 +993,32 @@ func ensureClaudeThinkingDisplay(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// stripClaudeRedactThinkingBeta keeps summarized thinking visible to clients.
+// The redact-thinking beta can return signature-only blocks even when the model
+// spends output tokens on thinking. Preserve it when the client explicitly asks
+// for another display mode, such as "omitted".
+func stripClaudeRedactThinkingBeta(header http.Header, body []byte) {
+	if !strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "thinking.display").String()), "summarized") {
+		return
+	}
+
+	const redactThinkingBeta = "redact-thinking-2026-02-12"
+	values := strings.Split(strings.Join(header.Values("Anthropic-Beta"), ","), ",")
+	filtered := values[:0]
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || strings.EqualFold(value, redactThinkingBeta) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	if len(filtered) == 0 {
+		header.Del("Anthropic-Beta")
+		return
+	}
+	header.Set("Anthropic-Beta", strings.Join(filtered, ","))
 }
 
 type compositeReadCloser struct {

@@ -2979,3 +2979,29 @@ func TestEnsureClaudeThinkingDisplay_SkipsWhenThinkingMissing(t *testing.T) {
 		t.Fatalf("thinking should remain absent: %s", out)
 	}
 }
+
+func TestStripClaudeRedactThinkingBeta_ForSummarizedThinking(t *testing.T) {
+	header := http.Header{}
+	header.Set("Anthropic-Beta", "claude-code-20250219,redact-thinking-2026-02-12,interleaved-thinking-2025-05-14")
+
+	stripClaudeRedactThinkingBeta(header, []byte(`{"thinking":{"type":"enabled","budget_tokens":2048,"display":"summarized"}}`))
+
+	got := header.Get("Anthropic-Beta")
+	if strings.Contains(got, "redact-thinking") {
+		t.Fatalf("redact-thinking beta should be removed for summarized thinking: %q", got)
+	}
+	if !strings.Contains(got, "claude-code-20250219") || !strings.Contains(got, "interleaved-thinking-2025-05-14") {
+		t.Fatalf("unrelated betas should be preserved: %q", got)
+	}
+}
+
+func TestStripClaudeRedactThinkingBeta_PreservesExplicitOmittedDisplay(t *testing.T) {
+	header := http.Header{}
+	header.Set("Anthropic-Beta", "claude-code-20250219,redact-thinking-2026-02-12")
+
+	stripClaudeRedactThinkingBeta(header, []byte(`{"thinking":{"type":"enabled","display":"omitted"}}`))
+
+	if got := header.Get("Anthropic-Beta"); !strings.Contains(got, "redact-thinking-2026-02-12") {
+		t.Fatalf("redact-thinking beta should be preserved for omitted display: %q", got)
+	}
+}
