@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -62,6 +64,7 @@ const (
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
+type preparedModelRouteContextKey struct{}
 type executionSessionContextKey struct{}
 type disallowFreeAuthContextKey struct{}
 
@@ -138,6 +141,26 @@ func WithSelectedAuthIDCallback(ctx context.Context, callback func(string)) cont
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, selectedAuthCallbackContextKey{}, callback)
+}
+
+// PrepareStreamModelRoute resolves a stream route once and stores it on the returned context for execution.
+// The boolean reports whether the route overrides normal model-to-provider resolution.
+func (h *BaseAPIHandler) PrepareStreamModelRoute(ctx context.Context, handlerType string, modelName string, rawJSON []byte) (context.Context, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	decision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, true, modelExecutionOptions{})
+	ctx = context.WithValue(ctx, preparedModelRouteContextKey{}, decision)
+	hasOverride := strings.TrimSpace(decision.ExecutorPluginID) != "" || strings.TrimSpace(decision.Provider) != ""
+	return ctx, hasOverride
+}
+
+func preparedModelRouteFromContext(ctx context.Context) (modelRouteDecision, bool) {
+	if ctx == nil {
+		return modelRouteDecision{}, false
+	}
+	decision, ok := ctx.Value(preparedModelRouteContextKey{}).(modelRouteDecision)
+	return decision, ok
 }
 
 // WithExecutionSessionID returns a child context tagged with a long-lived execution session ID.
@@ -259,8 +282,10 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Only include it if the client explicitly provides it.
 	key := ""
 	requestPath := ""
+	var ginCtx *gin.Context
 	if ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		if requestGinCtx, ok := ctx.Value("gin").(*gin.Context); ok && requestGinCtx != nil && requestGinCtx.Request != nil {
+			ginCtx = requestGinCtx
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 			requestPath = strings.TrimSpace(ginCtx.FullPath())
 			if requestPath == "" && ginCtx.Request.URL != nil {
@@ -282,6 +307,11 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
+	if ginCtx != nil && !websocket.IsWebSocketUpgrade(ginCtx.Request) {
+		if traceCallback := logging.GinCPATraceIDCallback(ginCtx); traceCallback != nil {
+			meta[coreexecutor.SelectedAuthIndexCallbackMetadataKey] = traceCallback
+		}
+	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
@@ -289,6 +319,17 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+func addAuthSelectionModelMetadata(meta map[string]any, model string) {
+	if meta == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	meta[coreexecutor.AuthSelectionModelMetadataKey] = model
 }
 
 func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, rawJSON []byte) {
@@ -306,7 +347,7 @@ func setServiceTierMetadata(meta map[string]any, rawJSON []byte) {
 	if meta == nil {
 		return
 	}
-	serviceTier := coreusage.DefaultServiceTier
+	serviceTier := coreusage.AutoServiceTier
 	node := gjson.GetBytes(rawJSON, "service_tier")
 	if node.Exists() {
 		value := strings.TrimSpace(node.String())
@@ -315,6 +356,19 @@ func setServiceTierMetadata(meta map[string]any, rawJSON []byte) {
 		}
 	}
 	meta[coreexecutor.ServiceTierMetadataKey] = serviceTier
+}
+
+func setGenerateMetadata(meta map[string]any, rawJSON []byte) {
+	if meta == nil {
+		return
+	}
+	// Missing or true means generation is enabled; only an explicit false disables generation.
+	generate := true
+	node := gjson.GetBytes(rawJSON, "generate")
+	if node.Exists() && node.IsBool() && !node.Bool() {
+		generate = false
+	}
+	meta[coreexecutor.GenerateMetadataKey] = generate
 }
 
 // headersFromContext extracts the original HTTP request headers from the gin context
@@ -710,18 +764,24 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
+	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	setGenerateMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -779,14 +839,17 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	if routeDecision.ExecutorPluginID != "" {
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision)
+	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision, execOptions)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	setGenerateMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -832,6 +895,9 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 }
 
 func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
+	}
 	host := h.pluginExecutorHost()
 	if host == nil {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
@@ -850,6 +916,9 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 }
 
 func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerType, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
+	}
 	host := h.pluginExecutorHost()
 	if host == nil {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
@@ -870,9 +939,11 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions) (coreexecutor.Request, coreexecutor.Options) {
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	setGenerateMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -948,6 +1019,12 @@ func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, 
 }
 
 func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
+		close(errChan)
+		return nil, nil, errChan
+	}
 	host := h.pluginExecutorHost()
 	if host == nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -977,18 +1054,8 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
-	upstreamHeaders := downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled)
-	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
-		upstreamHeaders = make(http.Header)
-	}
-	streamHeadersCommitted := false
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
-		if streamHeadersCommitted || upstreamHeaders == nil {
-			return
-		}
-		nextHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
-		replaceHeader(upstreamHeaders, nextHeaders)
 	}
 	if streamInterceptorsActive {
 		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
@@ -1003,6 +1070,10 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			Metadata:        opts.Metadata,
 		}, execOptions.SkipInterceptorPluginID)
 		applyStreamHeaders(intercepted.Headers)
+	}
+	upstreamHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
+	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
+		upstreamHeaders = make(http.Header)
 	}
 
 	dataChan := make(chan []byte)
@@ -1075,7 +1146,6 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 					return
 				}
 			}
-			streamHeadersCommitted = true
 			select {
 			case dataChan <- payload:
 				if streamInterceptorsActive {
@@ -1095,23 +1165,35 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
-	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
+	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx)
+	if !preparedRoute {
+		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
+	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
+	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	setGenerateMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -1153,33 +1235,34 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		close(errChan)
 		return nil, nil, errChan
 	}
+	if streamResult == nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("auth manager returned nil stream")}
+		close(errChan)
+		return nil, nil, errChan
+	}
 	executedRequest := func() (coreexecutor.Request, coreexecutor.Options) {
 		return afterAuthCapture.apply(req, opts)
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
-	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
-	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
+	// Resolve bootstrap retries and header initialization before returning so the
+	// returned header snapshot is never modified by the stream goroutine.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
-	upstreamHeaders := downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled)
-	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
-		upstreamHeaders = make(http.Header)
-	}
 	chunks := streamResult.Chunks
-	dataChan := make(chan []byte)
-	errChan := make(chan *interfaces.ErrorMessage, 1)
+	if chunks == nil {
+		closed := make(chan coreexecutor.StreamChunk)
+		close(closed)
+		chunks = closed
+	}
+	streamClosedBeforeRead := false
+	streamCanceledBeforeRead := false
 	streamHeaderInitialized := false
-	streamHeadersCommitted := false
 
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
-		if streamHeadersCommitted {
-			return
-		}
-		nextHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
-		replaceHeader(upstreamHeaders, nextHeaders)
 	}
 
 	applyStreamHeaderInit := func() {
@@ -1202,9 +1285,48 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		streamHeaderInitialized = true
 	}
 
-	pendingChunks := make([]coreexecutor.StreamChunk, 0, 1)
-	streamClosedBeforeRead := false
-	streamCanceledBeforeRead := false
+	transformStreamPayload := func(payload []byte, chunkIndex *int, historyChunks [][]byte) ([]byte, bool, *interfaces.ErrorMessage) {
+		applyStreamHeaderInit()
+		payload = cloneBytes(payload)
+		if streamInterceptorsActive {
+			executedReq, executedOpts := executedRequest()
+			intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+				SourceFormat:    responseProtocol,
+				Model:           normalizedModel,
+				RequestedModel:  originalRequestedModel,
+				RequestHeaders:  cloneHeader(executedOpts.Headers),
+				ResponseHeaders: cloneHeader(rawStreamHeaders),
+				OriginalRequest: cloneBytes(executedOpts.OriginalRequest),
+				RequestBody:     cloneBytes(executedReq.Payload),
+				Body:            payload,
+				HistoryChunks:   cloneByteSlices(historyChunks),
+				ChunkIndex:      *chunkIndex,
+				Metadata:        executedOpts.Metadata,
+			}, execOptions.SkipInterceptorPluginID)
+			applyStreamHeaders(intercepted.Headers)
+			if len(intercepted.Body) > 0 {
+				payload = cloneBytes(intercepted.Body)
+			}
+			(*chunkIndex)++
+			if intercepted.DropChunk {
+				return nil, false, nil
+			}
+		} else {
+			(*chunkIndex)++
+		}
+		if responseProtocol == "openai-response" {
+			if errValidate := validateSSEDataJSON(payload); errValidate != nil {
+				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate}
+			}
+		}
+		return payload, true, nil
+	}
+
+	var bootstrapPayload []byte
+	bootstrapChunkIndex := 0
+	var bootstrapHistoryChunks [][]byte
+	var bootstrapStreamErr error
+	var bootstrapErr *interfaces.ErrorMessage
 	readInitialStreamChunks := func() {
 		for {
 			var chunk coreexecutor.StreamChunk
@@ -1224,17 +1346,85 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				applyStreamHeaderInit()
 				return
 			}
-			pendingChunks = append(pendingChunks, chunk)
 			if chunk.Err != nil {
+				bootstrapStreamErr = chunk.Err
 				return
 			}
-			if len(chunk.Payload) > 0 {
-				applyStreamHeaderInit()
+			if len(chunk.Payload) == 0 {
+				continue
+			}
+			payload, deliverable, errMsg := transformStreamPayload(chunk.Payload, &bootstrapChunkIndex, bootstrapHistoryChunks)
+			if errMsg != nil {
+				bootstrapErr = errMsg
 				return
 			}
+			if !deliverable {
+				continue
+			}
+			bootstrapPayload = payload
+			return
 		}
 	}
-	readInitialStreamChunks()
+
+	bootstrapEligible := func(err error) bool {
+		status := statusFromError(err)
+		if status == 0 {
+			return true
+		}
+		switch status {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired,
+			http.StatusRequestTimeout, http.StatusTooManyRequests:
+			return true
+		default:
+			return status >= http.StatusInternalServerError
+		}
+	}
+
+	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+	if h.AuthManager.HomeEnabled() {
+		maxBootstrapRetries = 0
+	}
+	for bootstrapRetries := 0; !streamCanceledBeforeRead; {
+		readInitialStreamChunks()
+		if streamCanceledBeforeRead || bootstrapErr != nil || bootstrapStreamErr == nil {
+			break
+		}
+		if bootstrapRetries >= maxBootstrapRetries || !bootstrapEligible(bootstrapStreamErr) {
+			bootstrapErr = executionErrorMessage(bootstrapStreamErr)
+			break
+		}
+		bootstrapRetries++
+		retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+		if retryErr != nil {
+			bootstrapErr = executionErrorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel))
+			break
+		}
+		if retryResult == nil {
+			bootstrapErr = executionErrorMessage(fmt.Errorf("auth manager returned nil stream"))
+			break
+		}
+		rawStreamHeaders = cloneHeader(retryResult.Headers)
+		baseStreamHeaders = cloneHeader(retryResult.Headers)
+		streamHeaderInitialized = false
+		streamClosedBeforeRead = false
+		bootstrapStreamErr = nil
+		bootstrapPayload = nil
+		bootstrapChunkIndex = 0
+		bootstrapHistoryChunks = nil
+		chunks = retryResult.Chunks
+		if chunks == nil {
+			closed := make(chan coreexecutor.StreamChunk)
+			close(closed)
+			chunks = closed
+		}
+	}
+
+	upstreamHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
+	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
+		upstreamHeaders = make(http.Header)
+	}
+	dataChan := make(chan []byte)
+	errChan := make(chan *interfaces.ErrorMessage, 1)
 
 	go func() {
 		defer close(dataChan)
@@ -1242,11 +1432,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		if streamCanceledBeforeRead {
 			return
 		}
-		sentPayload := false
-		bootstrapRetries := 0
-		chunkIndex := 0
-		var historyChunks [][]byte
-		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -1274,116 +1459,47 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			}
 		}
 
-		bootstrapEligible := func(err error) bool {
-			status := statusFromError(err)
-			if status == 0 {
-				return true
-			}
-			switch status {
-			case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired,
-				http.StatusRequestTimeout, http.StatusTooManyRequests:
-				return true
-			default:
-				return status >= http.StatusInternalServerError
-			}
+		if bootstrapErr != nil {
+			_ = sendErr(bootstrapErr)
+			return
 		}
 
-	outer:
-		for {
-			for {
-				chunk, ok, canceled := nextStreamChunk(ctx, &pendingChunks, &streamClosedBeforeRead, chunks)
-				if canceled {
-					return
-				}
-				if !ok {
-					applyStreamHeaderInit()
-					return
-				}
-				if chunk.Err != nil {
-					streamErr := chunk.Err
-					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
-					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
-					if !sentPayload {
-						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
-							bootstrapRetries++
-							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-							if retryErr == nil {
-								rawStreamHeaders = cloneHeader(retryResult.Headers)
-								baseStreamHeaders = cloneHeader(retryResult.Headers)
-								replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
-								streamHeaderInitialized = false
-								streamHeadersCommitted = false
-								pendingChunks = nil
-								streamClosedBeforeRead = false
-								chunks = retryResult.Chunks
-								continue outer
-							}
-							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
-						}
-					}
-
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
-					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
-					}
-					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
-					return
-				}
-				if len(chunk.Payload) > 0 {
-					applyStreamHeaderInit()
-					payload := cloneBytes(chunk.Payload)
-					if streamInterceptorsActive {
-						executedReq, executedOpts := executedRequest()
-						intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
-							SourceFormat:    responseProtocol,
-							Model:           normalizedModel,
-							RequestedModel:  originalRequestedModel,
-							RequestHeaders:  cloneHeader(executedOpts.Headers),
-							ResponseHeaders: cloneHeader(rawStreamHeaders),
-							OriginalRequest: cloneBytes(executedOpts.OriginalRequest),
-							RequestBody:     cloneBytes(executedReq.Payload),
-							Body:            payload,
-							HistoryChunks:   cloneByteSlices(historyChunks),
-							ChunkIndex:      chunkIndex,
-							Metadata:        executedOpts.Metadata,
-						}, execOptions.SkipInterceptorPluginID)
-						applyStreamHeaders(intercepted.Headers)
-						if len(intercepted.Body) > 0 {
-							payload = cloneBytes(intercepted.Body)
-						}
-						chunkIndex++
-						if intercepted.DropChunk {
-							continue
-						}
-					} else {
-						chunkIndex++
-					}
-					if responseProtocol == "openai-response" {
-						if errValidate := validateSSEDataJSON(payload); errValidate != nil {
-							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
-							return
-						}
-					}
-					sentPayload = true
-					streamHeadersCommitted = true
-					if okSendData := sendData(payload); !okSendData {
-						return
-					}
-					if streamInterceptorsActive {
-						historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
-					}
-				}
+		chunkIndex := bootstrapChunkIndex
+		historyChunks := bootstrapHistoryChunks
+		if bootstrapPayload != nil {
+			if okSendData := sendData(bootstrapPayload); !okSendData {
+				return
 			}
-			applyStreamHeaderInit()
-			return
+			if streamInterceptorsActive {
+				historyChunks = appendStreamInterceptorHistory(historyChunks, bootstrapPayload)
+			}
+		}
+		for {
+			chunk, ok, canceled := nextStreamChunk(ctx, nil, &streamClosedBeforeRead, chunks)
+			if canceled || !ok {
+				return
+			}
+			if chunk.Err != nil {
+				_ = sendErr(executionErrorMessage(chunk.Err))
+				return
+			}
+			if len(chunk.Payload) == 0 {
+				continue
+			}
+			payload, deliverable, errMsg := transformStreamPayload(chunk.Payload, &chunkIndex, historyChunks)
+			if errMsg != nil {
+				_ = sendErr(errMsg)
+				return
+			}
+			if !deliverable {
+				continue
+			}
+			if okSendData := sendData(payload); !okSendData {
+				return
+			}
+			if streamInterceptorsActive {
+				historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
+			}
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
@@ -1418,6 +1534,68 @@ func validateSSEDataJSON(chunk []byte) error {
 	return nil
 }
 
+func preferExecutionProvider(providers []string, preferred string) []string {
+	preferred = strings.ToLower(strings.TrimSpace(preferred))
+	if preferred == "" || len(providers) < 2 {
+		return providers
+	}
+	preferredIndex := -1
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) == preferred {
+			preferredIndex = i
+			break
+		}
+	}
+	if preferredIndex <= 0 {
+		return providers
+	}
+	out := make([]string, 0, len(providers))
+	out = append(out, providers[preferredIndex])
+	out = append(out, providers[:preferredIndex]...)
+	out = append(out, providers[preferredIndex+1:]...)
+	return out
+}
+
+func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []string) []string {
+	if entryProtocol == Interactions {
+		return preferExecutionProvider(providers, GeminiInteractions)
+	}
+	if supportsNativeInteractionsEntryProtocol(entryProtocol) {
+		return providers
+	}
+	return excludeExecutionProvider(providers, GeminiInteractions)
+}
+
+func supportsNativeInteractionsEntryProtocol(entryProtocol string) bool {
+	switch entryProtocol {
+	case Interactions, OpenAI, OpenaiResponse, Claude, Gemini:
+		return true
+	default:
+		return false
+	}
+}
+
+func excludeExecutionProvider(providers []string, excluded string) []string {
+	excluded = strings.ToLower(strings.TrimSpace(excluded))
+	if excluded == "" || len(providers) == 0 {
+		return providers
+	}
+	excludedIndex := -1
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) == excluded {
+			excludedIndex = i
+			break
+		}
+	}
+	if excludedIndex == -1 {
+		return providers
+	}
+	out := make([]string, 0, len(providers)-1)
+	out = append(out, providers[:excludedIndex]...)
+	out = append(out, providers[excludedIndex+1:]...)
+	return out
+}
+
 func statusFromError(err error) int {
 	if err == nil {
 		return 0
@@ -1434,10 +1612,48 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	return h.getRequestDetailsWithOptions(modelName, false)
 }
 
+func validateNativeInteractionsExecution(entryProtocol string, execOptions modelExecutionOptions, routeDecision modelRouteDecision) *interfaces.ErrorMessage {
+	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
+	if forcedProvider == "" || entryProtocol != Interactions {
+		return nil
+	}
+	if routeDecision.ExecutorPluginID != "" {
+		return nativeInteractionsExecutionError()
+	}
+	if routeProvider := strings.ToLower(strings.TrimSpace(routeDecision.Provider)); routeProvider != "" && routeProvider != forcedProvider {
+		return nativeInteractionsExecutionError()
+	}
+	return nil
+}
+
+func nativeInteractionsExecutionError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      fmt.Errorf("agent is only supported for native interactions execution"),
+	}
+}
+
 // providersForExecution resolves the providers and normalized model for a request. When a model
 // router selected a built-in provider, it skips model->provider resolution and uses the router's
 // provider (with an optional target model); otherwise it falls back to the registry-based path.
-func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision) ([]string, string, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
+	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
+	if forcedProvider != "" {
+		if routeDecision.ExecutorPluginID != "" {
+			return nil, "", nativeInteractionsExecutionError()
+		}
+		if routeProvider := strings.ToLower(strings.TrimSpace(routeDecision.Provider)); routeProvider != "" && routeProvider != forcedProvider {
+			return nil, "", nativeInteractionsExecutionError()
+		}
+		normalizedModel := strings.TrimSpace(modelName)
+		if normalizedModel == "" {
+			normalizedModel = strings.TrimSpace(originalRequestedModel)
+		}
+		if errMsg := h.validateImageOnlyModel(normalizedModel, allowImageModel); errMsg != nil {
+			return nil, "", errMsg
+		}
+		return []string{forcedProvider}, normalizedModel, nil
+	}
 	if routeDecision.Provider != "" {
 		normalizedModel := originalRequestedModel
 		if routeDecision.Model != "" {
@@ -1519,7 +1735,7 @@ func (h *BaseAPIHandler) validateImageOnlyModel(modelName string, allowImageMode
 
 func isOpenAIImageOnlyModel(model string) bool {
 	switch strings.ToLower(strings.TrimSpace(routeModelBaseName(model))) {
-	case "gpt-image-1.5", "gpt-image-2":
+	case "gpt-image-1.5", "gpt-image-2", "grok-imagine-image", "grok-imagine-image-quality":
 		return true
 	default:
 		return false
@@ -1613,15 +1829,6 @@ func byteSlicesSize(items [][]byte) int {
 		total += len(item)
 	}
 	return total
-}
-
-func replaceHeader(dst http.Header, src http.Header) {
-	for key := range dst {
-		delete(dst, key)
-	}
-	for key, values := range src {
-		dst[key] = append([]string(nil), values...)
-	}
 }
 
 func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
@@ -2053,9 +2260,14 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
+	if msg != nil && msg.Error != nil {
+		for _, value := range coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After") {
+			c.Writer.Header().Add("Retry-After", value)
+		}
+	}
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
-			if len(values) == 0 {
+			if len(values) == 0 || IsCPAReservedResponseHeader(key) {
 				continue
 			}
 			c.Writer.Header().Del(key)
